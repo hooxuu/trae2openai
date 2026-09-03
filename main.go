@@ -590,6 +590,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, _ := json.Marshal(traeReq)
 
+	if debugSSE {
+		log.Printf("[req] payload=%s", truncate(string(payload), 2000))
+	}
+
 	req, _ := http.NewRequestWithContext(ctx, "POST",
 		s.cfg.Host+"/api/ide/v2/llm_raw_chat", bytes.NewReader(payload))
 	setIDEHeaders(req, token)
@@ -638,7 +642,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 func convertMessages(msgs []OAIMessage) ([]TraeMessage, error) {
 	out := make([]TraeMessage, 0, len(msgs))
 	for _, m := range msgs {
-		tm := TraeMessage{Role: m.Role, ToolCallID: m.ToolCallID, ToolCalls: m.ToolCalls}
+		tm := TraeMessage{Role: m.Role, ToolCallID: m.ToolCallID, ToolCalls: denormalizeToolCalls(m.ToolCalls)}
 		if len(m.Content) == 0 || string(m.Content) == "null" {
 			tm.Content = []json.RawMessage{}
 			out = append(out, tm)
@@ -704,6 +708,37 @@ func convertTools(raw json.RawMessage) (json.RawMessage, error) {
 		out = append(out, map[string]any{"type": typ, "function": fn})
 	}
 	return json.Marshal(out)
+}
+
+// denormalizeToolCalls is the request-direction inverse of normalizeToolCalls:
+// OpenAI clients send assistant tool_calls as {id, type, function:{name,
+// arguments}}, but Trae's eino backend emits/expects function_call (not
+// function). Without this, the backend cannot register the tool_call_id,
+// and the next turn's tool result is rejected with
+// "tool_call_id is not found" (code 4027).
+func denormalizeToolCalls(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return raw
+	}
+	var calls []map[string]any
+	if json.Unmarshal(raw, &calls) != nil {
+		return raw
+	}
+	for _, c := range calls {
+		// already in Trae format (has function_call) — leave as-is
+		if _, ok := c["function_call"]; ok {
+			continue
+		}
+		if fn, ok := c["function"]; ok && fn != nil {
+			c["function_call"] = fn
+			delete(c, "function")
+		}
+	}
+	out, err := json.Marshal(calls)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // normalizeToolCalls converts Trae's tool_call format
@@ -817,10 +852,19 @@ type chatResult struct {
 	toolCalls json.RawMessage
 	finish    string
 	usage     *usageEvent
+	sawDone   bool // set when the upstream "done" event is received
 }
+
+// debugSSE logs every upstream SSE event and payload; enable with
+// TRAE_DEBUG_SSE=1. It is what separates "the model returned an empty
+// completion" from "the adapter dropped or misread the stream".
+var debugSSE = os.Getenv("TRAE_DEBUG_SSE") == "1"
 
 func handleEvents(ctx context.Context, body io.Reader, onOutput func(outputEvent), res *chatResult) error {
 	return parseSSE(ctx, body, func(ev sseEvent) {
+		if debugSSE {
+			log.Printf("[sse] event=%q data=%s", ev.name, truncate(ev.data, 400))
+		}
 		switch ev.name {
 		case "output":
 			var o outputEvent
@@ -843,11 +887,22 @@ func handleEvents(ctx context.Context, body io.Reader, onOutput func(outputEvent
 				res.usage = &u
 			}
 		case "done":
+			res.sawDone = true
 			var d struct {
 				FinishReason string `json:"finish_reason"`
 			}
 			if json.Unmarshal([]byte(ev.data), &d) == nil && d.FinishReason != "" {
 				res.finish = d.FinishReason
+			}
+		default:
+			// Trae can push "error"/"exception" side events mid-stream. Never
+			// swallow them silently: they are exactly the difference between
+			// "model returned empty content" and "upstream failed".
+			if strings.Contains(ev.name, "error") || strings.Contains(ev.name, "exception") ||
+				strings.Contains(ev.data, `"error"`) {
+				log.Printf("[sse] upstream error event %q: %s", ev.name, truncate(ev.data, 400))
+			} else if debugSSE {
+				log.Printf("[sse] unhandled event %q", ev.name)
 			}
 		}
 	})
@@ -871,8 +926,20 @@ func (s *Server) collectSSE(w http.ResponseWriter, body io.Reader, id string, cr
 		writeOpenAIError(w, http.StatusBadGateway, "stream read error: "+err.Error(), "server_error")
 		return
 	}
+	if !res.sawDone {
+		log.Printf("[chat] WARN: upstream stream ended without done event (content=%d bytes, finish=%q)",
+			res.content.Len(), res.finish)
+	}
 	if res.finish == "" {
-		res.finish = "stop"
+		if res.sawDone {
+			res.finish = "stop"
+		} else {
+			res.finish = "length" // stream terminated upstream without a stop
+		}
+	}
+	if res.content.Len() == 0 && res.reasoning.Len() == 0 && len(res.toolCalls) == 0 {
+		log.Printf("[chat] WARN: upstream returned empty completion (finish=%q, model=%s)",
+			res.finish, model.ConfigName)
 	}
 	msg := map[string]any{"role": "assistant", "content": res.content.String()}
 	if res.reasoning.Len() > 0 {
@@ -946,9 +1013,19 @@ func (s *Server) streamSSE(w http.ResponseWriter, body io.Reader, id string, cre
 	if finish == "" {
 		if err != nil {
 			finish = "error"
-		} else {
+		} else if res.sawDone {
 			finish = "stop"
+		} else {
+			finish = "length" // stream ended upstream without a terminal done
 		}
+	}
+	if !res.sawDone && err == nil {
+		log.Printf("[chat] WARN: upstream stream ended without done event (content=%d bytes)",
+			res.content.Len())
+	}
+	if res.content.Len() == 0 && res.reasoning.Len() == 0 && len(res.toolCalls) == 0 {
+		log.Printf("[chat] WARN: upstream returned empty completion (finish=%q, model=%s)",
+			finish, model.ConfigName)
 	}
 	send(map[string]any{
 		"id": id, "object": "chat.completion.chunk", "created": created, "model": model.ConfigName,
