@@ -281,6 +281,14 @@ func (tm *TokenManager) exchange(refreshToken string) error {
 		return fmt.Errorf("bad response: %w", err)
 	}
 	if env.Code != 0 {
+		// 30021/30022 come back as "网络异常" / "network error", which is
+		// misleading: Trae answers that for any rejected refresh token (revoked,
+		// expired, or from another tenant). Say so, otherwise the operator goes
+		// hunting for a network problem that does not exist.
+		if env.Code == 30021 || env.Code == 30022 {
+			return fmt.Errorf("code=%d message=%s (not a network problem despite the wording: Trae rejects the refresh token - revoked, expired or wrong tenant. Regenerate the CLI login token: https://docs.trae.cn/cli_login-token)",
+				env.Code, env.Message)
+		}
 		return fmt.Errorf("code=%d message=%s", env.Code, env.Message)
 	}
 	var tok OauthToken
@@ -567,6 +575,15 @@ func writeOpenAIError(w http.ResponseWriter, status int, msg, typ string) {
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	list := s.registry.List()
+	if len(list) == 0 {
+		if err := s.registry.LastError(); err != nil {
+			// An empty catalog is not "no models": it is usually a rejected token
+			// or a rejected client version, and the caller deserves to know which.
+			writeOpenAIError(w, http.StatusBadGateway,
+				"model catalog unavailable: "+err.Error(), "upstream_error")
+			return
+		}
+	}
 	data := make([]map[string]any, 0, len(list))
 	for _, m := range list {
 		data = append(data, map[string]any{
@@ -650,7 +667,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	token, err := s.tm.AccessToken(ctx)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "token unavailable: "+err.Error(), "server_error")
+		writeOpenAIError(w, http.StatusBadGateway,
+			"token unavailable: "+err.Error()+"; check TRAECLI_PERSONAL_ACCESS_TOKEN (https://docs.trae.cn/cli_login-token)",
+			"upstream_error")
 		return
 	}
 
@@ -1307,9 +1326,17 @@ func main() {
 
 	tm := NewTokenManager(cfg)
 	if err := tm.Bootstrap(); err != nil {
-		log.Fatalf("[auth] %v", err)
+		// Keep serving instead of dying: a crashed container hides the reason
+		// behind a restart loop, while an idle adapter reports it on every call
+		// (and to /healthz probes). Whatever token exists is retried below.
+		log.Printf("[auth] ERROR: %v", err)
+		log.Printf("[auth] serving without a usable token for now; requests will fail until it is fixed")
 	}
-	tm.StartRefreshLoop()
+	if tm.current() != nil || tm.refreshPAT() != "" {
+		tm.StartRefreshLoop()
+	} else {
+		log.Printf("[auth] no token and no PAT configured: set TRAECLI_PERSONAL_ACCESS_TOKEN (https://docs.trae.cn/cli_login-token)")
+	}
 
 	registry := NewModelRegistry(cfg.Host, tm, cfg.VersionCode, cfg.AllowVFallback)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

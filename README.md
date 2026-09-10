@@ -144,6 +144,19 @@ Trae 会拒绝过旧的客户端版本：聊天返回 `event: error {"code":4120
 
 报 `upstream error (code 1001): ... not able to authenticate you.` 表示登录令牌被吊销或过期。按官方流程在 Trae 网页 **个人信息 > 访问令牌 > CLI 登录令牌** 重新生成（专为 Docker/CI 场景设计，无需浏览器登录），再把 `TRAECLI_PERSONAL_ACCESS_TOKEN` 传给容器。文档：https://docs.trae.cn/cli_login-token
 
+### 令牌被拒：`code 30021` / `code 30022 "网络异常"`
+
+**这不是网络问题**——Trae 对“刷新令牌无效 / 被吊销 / 租户或环境不匹配”统一返回这句误导性文案。adapter 会把它原样透出并附处理指引：
+
+```
+code=30022 message=网络异常 (not a network problem despite the wording: Trae rejects the
+refresh token - revoked, expired or wrong tenant. Regenerate the CLI login token: ...)
+```
+
+处理：重新生成 CLI 登录令牌（见上），替换 `TRAECLI_PERSONAL_ACCESS_TOKEN`（或别名 `TRAE_PAT`）。另外确认令牌完整包含开头的 `trae-lt-`，且与 `TRAE_HOST` 属于同一环境/租户。
+
+启动时拿不到令牌**不会直接退出**：进程继续提供服务，`/healthz` 正常，`/v1/models` 与对话接口返回 502 并说明原因，同时后台每 30 秒重试换取令牌。这样容器不会变成重启循环，错误也不会被重启日志冲掉。
+
 ## License
 
 [MIT](LICENSE)
