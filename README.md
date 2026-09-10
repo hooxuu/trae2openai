@@ -57,7 +57,9 @@ docker run --rm -p 8686:8686 \
 | `TRAE_LISTEN` | 服务监听地址 | `127.0.0.1:8686` |
 | `TRAE_HOST` | Trae 后端地址 | `https://api.enterprise.trae.cn` |
 | `TRAE_STATE_FILE` | Token 状态文件路径 | `~/.trae-openai-state.json` |
-| `TRAE_IDE_VERSION_CODE` | 提供给 Trae 后端的客户端版本号（后端会拒绝过旧版本） | 当天日期，如 `20260910` |
+| `TRAE_IDE_VERSION_CODE` | 提供给 Trae 后端的客户端版本号（后端会拒绝过旧版本） | 自动识别：优先读本机 traecli 二进制里的真实常量，读不到则用内置已验证值 `20260206` |
+| `TRAE_CLI_BIN` | 指定用于识别版本号的 traecli 二进制路径 | 自动在 `PATH`、`~/.local/bin`、`~/.trae/bin` 等处查找 |
+| `TRAE_ALLOW_VERSION_FALLBACK` | 设为 `1` 时允许版本被拒后用合成版本号重试一次（应急，见 DESIGN.md 坑 6） | 关闭 |
 | `TRAE_DEBUG_SSE` | 设为 `1` 时打印上游 SSE 事件与外发请求，便于排障 | 关闭 |
 
 请妥善保管 PAT、API Key 和状态文件，不要提交到 Git 仓库。使用本项目时请遵守 Trae 的服务条款。

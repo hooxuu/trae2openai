@@ -20,6 +20,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -33,20 +34,25 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	Host        string // Trae backend, e.g. https://api.enterprise.trae.cn
-	Listen      string // local listen address
-	PAT         string // personal access token (= refresh token) bootstrap
-	StateFile   string // token persistence path
-	APIKey      string // client API key (sk-...) required by callers
-	VersionCode string // client version presented upstream (X-IDE-Version-Code)
+	Host           string // Trae backend, e.g. https://api.enterprise.trae.cn
+	Listen         string // local listen address
+	PAT            string // personal access token (= refresh token) bootstrap
+	StateFile      string // token persistence path
+	APIKey         string // client API key (sk-...) required by callers
+	VersionCode    string // client version presented upstream (X-IDE-Version-Code)
+	VersionFrom    string // where VersionCode came from (for logs)
+	AllowVFallback bool   // TRAE_ALLOW_VERSION_FALLBACK=1: permit a synthetic code
 }
 
 func loadConfig() Config {
+	versionCode, versionFrom := resolveVersionCode()
 	cfg := Config{
-		Host:        envOr("TRAE_HOST", "https://api.enterprise.trae.cn"),
-		Listen:      envOr("TRAE_LISTEN", "127.0.0.1:8686"),
-		PAT:         envOr("TRAE_PAT", os.Getenv("TRAECLI_PERSONAL_ACCESS_TOKEN")),
-		VersionCode: clientVersionCode(),
+		Host:           envOr("TRAE_HOST", "https://api.enterprise.trae.cn"),
+		Listen:         envOr("TRAE_LISTEN", "127.0.0.1:8686"),
+		PAT:            envOr("TRAE_PAT", os.Getenv("TRAECLI_PERSONAL_ACCESS_TOKEN")),
+		VersionCode:    versionCode,
+		VersionFrom:    versionFrom,
+		AllowVFallback: os.Getenv("TRAE_ALLOW_VERSION_FALLBACK") == "1",
 	}
 	if f := os.Getenv("TRAE_STATE_FILE"); f != "" {
 		cfg.StateFile = f
@@ -64,20 +70,102 @@ func envOr(k, def string) string {
 	return def
 }
 
-// clientVersionCode returns the client version presented to the Trae backend.
+// resolveVersionCode decides which X-IDE-Version-Code to present upstream:
 //
-// The backend enforces a rolling minimum: calls carrying an old
-// X-IDE-Version-Code are refused with an SSE error event and zero output
-// (verified 2026-09: chat needs >= 20260206, get_config_list >= 20251001, and
-// both accept future codes). A hardcoded build number therefore goes stale and
-// silently disables the whole proxy, so the default follows the current date -
-// roughly what a current official client reports - and TRAE_IDE_VERSION_CODE
-// overrides it.
-func clientVersionCode() string {
+//  1. TRAE_IDE_VERSION_CODE - explicit operator override;
+//  2. the constant embedded in the locally installed official CLI, so the proxy
+//     tracks the real client instead of inventing a number;
+//  3. defaultClientVersionCode - the last value verified against that client.
+func resolveVersionCode() (code, source string) {
 	if v := strings.TrimSpace(os.Getenv("TRAE_IDE_VERSION_CODE")); v != "" {
-		return v
+		return v, "TRAE_IDE_VERSION_CODE"
 	}
-	return time.Now().Format("20060102")
+	if v, path := versionCodeFromLocalCLI(); v != "" {
+		return v, "traecli binary " + path
+	}
+	return defaultClientVersionCode, "built-in default"
+}
+
+// versionCodeFromLocalCLI reads the version code out of an installed official
+// CLI. The Go string table keeps the X-IDE-Version constant ("99.99.99") right
+// after the version code, so the 8-digit code sits immediately before that
+// anchor. Returns "" when no binary or no plausible value is found.
+func versionCodeFromLocalCLI() (code, path string) {
+	if p := strings.TrimSpace(os.Getenv("TRAE_CLI_BIN")); p != "" {
+		if v := versionCodeFromBinary(p); v != "" {
+			return v, p
+		}
+		log.Printf("[version] WARN: no version code found in TRAE_CLI_BIN=%s", p)
+	}
+	for _, name := range []string{"traecli", "trae-cli", "trae-agent", "coco"} {
+		if p, err := exec.LookPath(name); err == nil {
+			if v := versionCodeFromBinary(p); v != "" {
+				return v, p
+			}
+		}
+	}
+	home, _ := os.UserHomeDir()
+	for _, p := range []string{
+		filepath.Join(home, ".local", "bin", "traecli"),
+		filepath.Join(home, ".trae", "bin", "traecli"),
+		"/usr/local/bin/traecli",
+		"/opt/homebrew/bin/traecli",
+	} {
+		if v := versionCodeFromBinary(p); v != "" {
+			return v, p
+		}
+	}
+	return "", ""
+}
+
+func versionCodeFromBinary(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	const anchor = "99.99.99"
+	const keep = 32 // enough overlap to straddle a chunk boundary
+	buf := make([]byte, 1<<20)
+	var tail []byte
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			chunk := make([]byte, 0, len(tail)+n)
+			chunk = append(chunk, tail...)
+			chunk = append(chunk, buf[:n]...)
+			for i := 8; i+len(anchor) <= len(chunk); i++ {
+				if string(chunk[i:i+len(anchor)]) != anchor {
+					continue
+				}
+				if v := string(chunk[i-8 : i]); plausibleVersionCode(v) {
+					return v
+				}
+			}
+			if len(chunk) > keep {
+				tail = append(tail[:0], chunk[len(chunk)-keep:]...)
+			} else {
+				tail = append(tail[:0], chunk...)
+			}
+		}
+		if err != nil {
+			return ""
+		}
+	}
+}
+
+// plausibleVersionCode accepts the date-shaped protocol marker (e.g. 20260206).
+func plausibleVersionCode(v string) bool {
+	if len(v) != 8 {
+		return false
+	}
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return v >= "20000101" && v <= "21001231"
 }
 
 // loadOrCreateAPIKey resolves the client API key (sk-...):
@@ -116,9 +204,18 @@ const (
 	refreshMargin = 5 * time.Minute // refresh this long before expiry
 	minTokenTTL   = 30 * time.Second
 
-	// clientVersionFallback is used for a single retry when the backend refuses
-	// the configured version code as too old. The backend only enforces a lower
-	// bound (verified: it accepts this value), so a far-future code is safe.
+	// defaultClientVersionCode is the constant the official client ships today,
+	// read straight out of the traecli string table ("X-App-Id" then
+	// "20260206" then "99.99.99"). It is a protocol generation marker, not a
+	// build date: traecli 0.120.52 (built 2026-08-12) still sends it, and the
+	// backend refuses anything older. Never invent a value here - a version the
+	// official client never released is exactly the kind of signal that makes
+	// traffic look synthetic.
+	defaultClientVersionCode = "20260206"
+
+	// clientVersionFallback is a synthetic value, used only when the operator
+	// opts in with TRAE_ALLOW_VERSION_FALLBACK=1 after the backend moved its
+	// version gate past everything real we know about.
 	clientVersionFallback = "20990101"
 
 	// errCodeVersionRejected is the SSE error code Trae returns when it refuses
@@ -333,39 +430,49 @@ type ModelInfo struct {
 }
 
 type ModelRegistry struct {
-	mu          sync.RWMutex
-	host        string
-	tm          *TokenManager
-	versionCode string
-	models      map[string]ModelInfo
-	fetchErr    error
-	lastAt      time.Time
+	mu            sync.RWMutex
+	host          string
+	tm            *TokenManager
+	versionCode   string
+	allowFallback bool
+	models        map[string]ModelInfo
+	fetchErr      error
+	lastAt        time.Time
 }
 
-func NewModelRegistry(host string, tm *TokenManager, versionCode string) *ModelRegistry {
-	return &ModelRegistry{host: host, tm: tm, versionCode: versionCode, models: map[string]ModelInfo{}}
+func NewModelRegistry(host string, tm *TokenManager, versionCode string, allowFallback bool) *ModelRegistry {
+	return &ModelRegistry{host: host, tm: tm, versionCode: versionCode, allowFallback: allowFallback,
+		models: map[string]ModelInfo{}}
 }
 
-// Fetch loads the model catalog, retrying once with clientVersionFallback when
-// the backend refuses the configured client version. The catalog is gated on
-// X-IDE-Version-Code too, and a refused version answers HTTP 500 code 2001 with
-// an empty list - which used to leave a stale catalog and nothing else.
+// Fetch loads the model catalog. The catalog is gated on X-IDE-Version-Code
+// too, and a refused version answers HTTP 500 code 2001 with an empty list -
+// which used to leave a stale catalog and nothing else. A synthetic retry only
+// happens when the operator opted in with TRAE_ALLOW_VERSION_FALLBACK=1.
 func (mr *ModelRegistry) Fetch(ctx context.Context) error {
-	mr.mu.RLock()
-	versionCode := mr.versionCode
-	mr.mu.RUnlock()
+	err := mr.fetchWith(ctx, mr.versionCode)
+	if err != nil && mr.allowFallback && mr.versionCode != clientVersionFallback {
+		log.Printf("[models] WARN: fetch with version_code=%s failed: %v; retrying with synthetic %s (TRAE_ALLOW_VERSION_FALLBACK=1)",
+			mr.versionCode, err, clientVersionFallback)
+		err = mr.fetchWith(ctx, clientVersionFallback)
+	}
 
-	err := mr.fetchWith(ctx, versionCode)
-	if err != nil && versionCode != clientVersionFallback {
-		log.Printf("[models] fetch with version_code=%s failed: %v; retrying with %s",
-			versionCode, err, clientVersionFallback)
-		if err = mr.fetchWith(ctx, clientVersionFallback); err == nil {
-			mr.mu.Lock()
-			mr.versionCode = clientVersionFallback
-			mr.mu.Unlock()
-		}
+	mr.mu.Lock()
+	mr.fetchErr = err
+	mr.mu.Unlock()
+	if err != nil {
+		log.Printf("[models] WARN: catalog fetch failed: %v (will serve the previous list)", err)
 	}
 	return err
+}
+
+// LastError reports the most recent catalog fetch failure (nil after a
+// success). Callers use it to explain an empty model list instead of answering
+// a misleading "model not found".
+func (mr *ModelRegistry) LastError() error {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return mr.fetchErr
 }
 
 func (mr *ModelRegistry) fetchWith(ctx context.Context, versionCode string) error {
@@ -482,28 +589,6 @@ type Server struct {
 	cfg      Config
 	tm       *TokenManager
 	registry *ModelRegistry
-
-	mu          sync.Mutex
-	versionCode string // cached code the backend accepted (learned from a retry)
-}
-
-// clientVersion returns the version code to present upstream, preferring one a
-// previous request proved acceptable.
-func (s *Server) clientVersion() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.versionCode == "" {
-		s.versionCode = s.cfg.VersionCode
-	}
-	return s.versionCode
-}
-
-// noteWorkingVersion remembers a version code the backend did not refuse, so a
-// stale configured code costs one failed attempt per process, not per request.
-func (s *Server) noteWorkingVersion(v string) {
-	s.mu.Lock()
-	s.versionCode = v
-	s.mu.Unlock()
 }
 
 func (s *Server) routes() http.Handler {
@@ -624,6 +709,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	model, ok := s.registry.Lookup(oai.Model)
 	if !ok {
+		if err := s.registry.LastError(); err != nil {
+			// The catalog is empty because the upstream call failed (version gate,
+			// credentials, network). Saying "model not found" here hides the real
+			// problem behind a misleading 404.
+			writeOpenAIError(w, http.StatusBadGateway,
+				"model catalog unavailable: "+err.Error(), "upstream_error")
+			return
+		}
 		writeOpenAIError(w, http.StatusNotFound,
 			fmt.Sprintf("model %q not found; see /v1/models", oai.Model), "model_not_found")
 		return
@@ -700,7 +793,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return http.DefaultClient.Do(req)
 	}
 
-	clientVersion := s.clientVersion()
+	clientVersion := s.cfg.VersionCode
 	resp, err := open(clientVersion)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed: "+err.Error(), "server_error")
@@ -1086,11 +1179,11 @@ func (s *Server) consumeUpstream(ctx context.Context, resp *http.Response, open 
 	if err != nil {
 		return err
 	}
-	if res.errCode != errCodeVersionRejected || !res.empty() || versionCode == clientVersionFallback {
+	if res.errCode != errCodeVersionRejected || !res.empty() || versionCode == clientVersionFallback || !s.cfg.AllowVFallback {
 		return nil
 	}
 
-	log.Printf("[chat] backend rejected client version_code=%s; retrying with %s",
+	log.Printf("[chat] WARN: backend rejected client version_code=%s; retrying once with synthetic %s (TRAE_ALLOW_VERSION_FALLBACK=1). Update traecli or set TRAE_IDE_VERSION_CODE if this repeats.",
 		versionCode, clientVersionFallback)
 	*res = chatResult{}
 	retry, err := open(clientVersionFallback)
@@ -1099,9 +1192,6 @@ func (s *Server) consumeUpstream(ctx context.Context, resp *http.Response, open 
 	}
 	err = handleEvents(ctx, retry.Body, onOutput, res)
 	retry.Body.Close()
-	if res.errCode != errCodeVersionRejected {
-		s.noteWorkingVersion(clientVersionFallback)
-	}
 	return err
 }
 
@@ -1283,7 +1373,11 @@ func main() {
 	cfg.APIKey = loadOrCreateAPIKey(cfg)
 	log.Printf("[auth] client API key: %s", cfg.APIKey)
 	if cfg.Host == "" || cfg.PAT == "" {
-		log.Printf("[cfg] TRAE_HOST=%s state=%s version_code=%s", cfg.Host, cfg.StateFile, cfg.VersionCode)
+		log.Printf("[cfg] TRAE_HOST=%s state=%s", cfg.Host, cfg.StateFile)
+	}
+	log.Printf("[version] client version code %s (source: %s)", cfg.VersionCode, cfg.VersionFrom)
+	if cfg.AllowVFallback {
+		log.Printf("[version] WARN: synthetic fallback %s enabled (TRAE_ALLOW_VERSION_FALLBACK=1)", clientVersionFallback)
 	}
 
 	tm := NewTokenManager(cfg)
@@ -1292,7 +1386,7 @@ func main() {
 	}
 	tm.StartRefreshLoop()
 
-	registry := NewModelRegistry(cfg.Host, tm, cfg.VersionCode)
+	registry := NewModelRegistry(cfg.Host, tm, cfg.VersionCode, cfg.AllowVFallback)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	if err := registry.Fetch(ctx); err != nil {
 		log.Printf("[models] initial fetch failed: %v (will serve empty list)", err)
