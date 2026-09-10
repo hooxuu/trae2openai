@@ -20,7 +20,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -76,96 +75,22 @@ func envOr(k, def string) string {
 //  2. the constant embedded in the locally installed official CLI, so the proxy
 //     tracks the real client instead of inventing a number;
 //  3. defaultClientVersionCode - the last value verified against that client.
+//
+// resolveVersionCode decides which X-IDE-Version-Code to present upstream:
+//
+//  1. TRAE_IDE_VERSION_CODE - explicit operator override;
+//  2. defaultClientVersionCode - the value the official client ships today.
+//
+// Deliberately no auto-detection. The adapter normally runs in a container
+// that has no Trae CLI installed, so reading whatever binary happens to sit on
+// the host would be both surprising and wrong. When Trae raises its version
+// gate the call fails loudly (see consumeUpstream) instead of guessing, and
+// defaultClientVersionCode gets bumped after checking the current CLI.
 func resolveVersionCode() (code, source string) {
 	if v := strings.TrimSpace(os.Getenv("TRAE_IDE_VERSION_CODE")); v != "" {
 		return v, "TRAE_IDE_VERSION_CODE"
 	}
-	if v, path := versionCodeFromLocalCLI(); v != "" {
-		return v, "traecli binary " + path
-	}
 	return defaultClientVersionCode, "built-in default"
-}
-
-// versionCodeFromLocalCLI reads the version code out of an installed official
-// CLI. The Go string table keeps the X-IDE-Version constant ("99.99.99") right
-// after the version code, so the 8-digit code sits immediately before that
-// anchor. Returns "" when no binary or no plausible value is found.
-func versionCodeFromLocalCLI() (code, path string) {
-	if p := strings.TrimSpace(os.Getenv("TRAE_CLI_BIN")); p != "" {
-		if v := versionCodeFromBinary(p); v != "" {
-			return v, p
-		}
-		log.Printf("[version] WARN: no version code found in TRAE_CLI_BIN=%s", p)
-	}
-	for _, name := range []string{"traecli", "trae-cli", "trae-agent", "coco"} {
-		if p, err := exec.LookPath(name); err == nil {
-			if v := versionCodeFromBinary(p); v != "" {
-				return v, p
-			}
-		}
-	}
-	home, _ := os.UserHomeDir()
-	for _, p := range []string{
-		filepath.Join(home, ".local", "bin", "traecli"),
-		filepath.Join(home, ".trae", "bin", "traecli"),
-		"/usr/local/bin/traecli",
-		"/opt/homebrew/bin/traecli",
-	} {
-		if v := versionCodeFromBinary(p); v != "" {
-			return v, p
-		}
-	}
-	return "", ""
-}
-
-func versionCodeFromBinary(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-
-	const anchor = "99.99.99"
-	const keep = 32 // enough overlap to straddle a chunk boundary
-	buf := make([]byte, 1<<20)
-	var tail []byte
-	for {
-		n, err := f.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, 0, len(tail)+n)
-			chunk = append(chunk, tail...)
-			chunk = append(chunk, buf[:n]...)
-			for i := 8; i+len(anchor) <= len(chunk); i++ {
-				if string(chunk[i:i+len(anchor)]) != anchor {
-					continue
-				}
-				if v := string(chunk[i-8 : i]); plausibleVersionCode(v) {
-					return v
-				}
-			}
-			if len(chunk) > keep {
-				tail = append(tail[:0], chunk[len(chunk)-keep:]...)
-			} else {
-				tail = append(tail[:0], chunk...)
-			}
-		}
-		if err != nil {
-			return ""
-		}
-	}
-}
-
-// plausibleVersionCode accepts the date-shaped protocol marker (e.g. 20260206).
-func plausibleVersionCode(v string) bool {
-	if len(v) != 8 {
-		return false
-	}
-	for _, r := range v {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return v >= "20000101" && v <= "21001231"
 }
 
 // loadOrCreateAPIKey resolves the client API key (sk-...):
