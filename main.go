@@ -33,18 +33,20 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	Host      string // Trae backend, e.g. https://api.enterprise.trae.cn
-	Listen    string // local listen address
-	PAT       string // personal access token (= refresh token) bootstrap
-	StateFile string // token persistence path
-	APIKey    string // client API key (sk-...) required by callers
+	Host        string // Trae backend, e.g. https://api.enterprise.trae.cn
+	Listen      string // local listen address
+	PAT         string // personal access token (= refresh token) bootstrap
+	StateFile   string // token persistence path
+	APIKey      string // client API key (sk-...) required by callers
+	VersionCode string // client version presented upstream (X-IDE-Version-Code)
 }
 
 func loadConfig() Config {
 	cfg := Config{
-		Host:   envOr("TRAE_HOST", "https://api.enterprise.trae.cn"),
-		Listen: envOr("TRAE_LISTEN", "127.0.0.1:8686"),
-		PAT:    envOr("TRAE_PAT", os.Getenv("TRAECLI_PERSONAL_ACCESS_TOKEN")),
+		Host:        envOr("TRAE_HOST", "https://api.enterprise.trae.cn"),
+		Listen:      envOr("TRAE_LISTEN", "127.0.0.1:8686"),
+		PAT:         envOr("TRAE_PAT", os.Getenv("TRAECLI_PERSONAL_ACCESS_TOKEN")),
+		VersionCode: clientVersionCode(),
 	}
 	if f := os.Getenv("TRAE_STATE_FILE"); f != "" {
 		cfg.StateFile = f
@@ -60,6 +62,22 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// clientVersionCode returns the client version presented to the Trae backend.
+//
+// The backend enforces a rolling minimum: calls carrying an old
+// X-IDE-Version-Code are refused with an SSE error event and zero output
+// (verified 2026-09: chat needs >= 20260206, get_config_list >= 20251001, and
+// both accept future codes). A hardcoded build number therefore goes stale and
+// silently disables the whole proxy, so the default follows the current date -
+// roughly what a current official client reports - and TRAE_IDE_VERSION_CODE
+// overrides it.
+func clientVersionCode() string {
+	if v := strings.TrimSpace(os.Getenv("TRAE_IDE_VERSION_CODE")); v != "" {
+		return v
+	}
+	return time.Now().Format("20060102")
 }
 
 // loadOrCreateAPIKey resolves the client API key (sk-...):
@@ -93,11 +111,20 @@ func generateAPIKey() string {
 }
 
 const (
-	appID          = "7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0"
-	ideVersion     = "99.99.99"
-	ideVersionCode = "20260206"
-	refreshMargin  = 5 * time.Minute // refresh this long before expiry
-	minTokenTTL    = 30 * time.Second
+	appID         = "7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0"
+	ideVersion    = "99.99.99"
+	refreshMargin = 5 * time.Minute // refresh this long before expiry
+	minTokenTTL   = 30 * time.Second
+
+	// clientVersionFallback is used for a single retry when the backend refuses
+	// the configured version code as too old. The backend only enforces a lower
+	// bound (verified: it accepts this value), so a far-future code is safe.
+	clientVersionFallback = "20990101"
+
+	// errCodeVersionRejected is the SSE error code Trae returns when it refuses
+	// the client version. Its payload carries an empty message, so the code is
+	// the only usable signal (verified 2026-09: code 4120 for stale versions).
+	errCodeVersionRejected = 4120
 )
 
 func newUUID() string {
@@ -306,27 +333,50 @@ type ModelInfo struct {
 }
 
 type ModelRegistry struct {
-	mu       sync.RWMutex
-	host     string
-	tm       *TokenManager
-	models   map[string]ModelInfo
-	fetchErr error
-	lastAt   time.Time
+	mu          sync.RWMutex
+	host        string
+	tm          *TokenManager
+	versionCode string
+	models      map[string]ModelInfo
+	fetchErr    error
+	lastAt      time.Time
 }
 
-func NewModelRegistry(host string, tm *TokenManager) *ModelRegistry {
-	return &ModelRegistry{host: host, tm: tm, models: map[string]ModelInfo{}}
+func NewModelRegistry(host string, tm *TokenManager, versionCode string) *ModelRegistry {
+	return &ModelRegistry{host: host, tm: tm, versionCode: versionCode, models: map[string]ModelInfo{}}
 }
 
+// Fetch loads the model catalog, retrying once with clientVersionFallback when
+// the backend refuses the configured client version. The catalog is gated on
+// X-IDE-Version-Code too, and a refused version answers HTTP 500 code 2001 with
+// an empty list - which used to leave a stale catalog and nothing else.
 func (mr *ModelRegistry) Fetch(ctx context.Context) error {
+	mr.mu.RLock()
+	versionCode := mr.versionCode
+	mr.mu.RUnlock()
+
+	err := mr.fetchWith(ctx, versionCode)
+	if err != nil && versionCode != clientVersionFallback {
+		log.Printf("[models] fetch with version_code=%s failed: %v; retrying with %s",
+			versionCode, err, clientVersionFallback)
+		if err = mr.fetchWith(ctx, clientVersionFallback); err == nil {
+			mr.mu.Lock()
+			mr.versionCode = clientVersionFallback
+			mr.mu.Unlock()
+		}
+	}
+	return err
+}
+
+func (mr *ModelRegistry) fetchWith(ctx context.Context, versionCode string) error {
 	token, err := mr.tm.AccessToken(ctx)
 	if err != nil {
 		return err
 	}
 	req, _ := http.NewRequestWithContext(ctx, "POST",
 		mr.host+"/api/ide/v1/cli/get_config_list",
-		strings.NewReader(`{"function":"chat","version_code":`+ideVersionCode+`}`))
-	setIDEHeaders(req, token)
+		strings.NewReader(`{"function":"chat","version_code":`+versionCode+`}`))
+	setIDEHeaders(req, token, versionCode)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -334,6 +384,9 @@ func (mr *ModelRegistry) Fetch(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(raw), 200))
+	}
 
 	var list struct {
 		ConfigInfoList []struct {
@@ -429,6 +482,28 @@ type Server struct {
 	cfg      Config
 	tm       *TokenManager
 	registry *ModelRegistry
+
+	mu          sync.Mutex
+	versionCode string // cached code the backend accepted (learned from a retry)
+}
+
+// clientVersion returns the version code to present upstream, preferring one a
+// previous request proved acceptable.
+func (s *Server) clientVersion() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.versionCode == "" {
+		s.versionCode = s.cfg.VersionCode
+	}
+	return s.versionCode
+}
+
+// noteWorkingVersion remembers a version code the backend did not refuse, so a
+// stale configured code costs one failed attempt per process, not per request.
+func (s *Server) noteWorkingVersion(v string) {
+	s.mu.Lock()
+	s.versionCode = v
+	s.mu.Unlock()
 }
 
 func (s *Server) routes() http.Handler {
@@ -461,13 +536,13 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func setIDEHeaders(req *http.Request, token string) {
+func setIDEHeaders(req *http.Request, token, versionCode string) {
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-App-Id", appID)
 	req.Header.Set("X-IDE-Function", "chat")
 	req.Header.Set("X-IDE-Version", ideVersion)
-	req.Header.Set("X-IDE-Version-Code", ideVersionCode)
+	req.Header.Set("X-IDE-Version-Code", versionCode)
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, msg, typ string) {
@@ -594,9 +669,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[req] payload=%s", truncate(string(payload), 2000))
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		s.cfg.Host+"/api/ide/v2/llm_raw_chat", bytes.NewReader(payload))
-	setIDEHeaders(req, token)
 	extra := map[string]any{
 		"agent_loop_id":         sessionID,
 		"api_host":              s.cfg.Host,
@@ -612,9 +684,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		"user_prompt_submit_id": sessionID,
 	}
 	extraJSON, _ := json.Marshal(extra)
-	req.Header.Set("extra", string(extraJSON))
 
-	resp, err := http.DefaultClient.Do(req)
+	// open issues one upstream call with the given client version. It is a closure
+	// so a version refusal can be retried without rebuilding the whole Trae
+	// payload (TraeChatRequest has no version field - it lives in the
+	// X-IDE-Version-Code header).
+	open := func(versionCode string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST",
+			s.cfg.Host+"/api/ide/v2/llm_raw_chat", bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		setIDEHeaders(req, token, versionCode)
+		req.Header.Set("extra", string(extraJSON))
+		return http.DefaultClient.Do(req)
+	}
+
+	clientVersion := s.clientVersion()
+	resp, err := open(clientVersion)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed: "+err.Error(), "server_error")
 		return
@@ -632,9 +719,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 
 	if oai.Stream {
-		s.streamSSE(w, resp.Body, chatID, created, oai, model)
+		s.streamSSE(w, resp, open, clientVersion, chatID, created, oai, model)
 	} else {
-		s.collectSSE(w, resp.Body, chatID, created, oai, model)
+		s.collectSSE(w, resp, open, clientVersion, chatID, created, oai, model)
 	}
 }
 
@@ -853,6 +940,68 @@ type chatResult struct {
 	finish    string
 	usage     *usageEvent
 	sawDone   bool // set when the upstream "done" event is received
+
+	// errCode/errMsg capture an upstream `event: error` payload. Without them the
+	// reason for a contentless completion is thrown away and the caller only sees
+	// a vague truncation - exactly how the 2026-09 version and auth rejections
+	// stayed invisible for a week.
+	errCode int
+	errMsg  string
+}
+
+// empty reports whether the upstream produced no usable output at all.
+func (r *chatResult) empty() bool {
+	return r.content.Len() == 0 && r.reasoning.Len() == 0 && len(r.toolCalls) == 0
+}
+
+// upstreamErr renders the captured upstream failure, or "" when there was none.
+func (r *chatResult) upstreamErr() string {
+	if r.errCode == 0 && r.errMsg == "" {
+		return ""
+	}
+	if r.errMsg != "" {
+		return fmt.Sprintf("upstream error (code %d): %s", r.errCode, r.errMsg)
+	}
+	return fmt.Sprintf("upstream error (code %d)", r.errCode)
+}
+
+// setUpstreamError records an upstream error payload. Trae uses a flat shape
+// ({"code":4120,"error":"","message":"..."}) but the OpenAI nesting
+// ({"error":{"code":..,"message":..}}) is accepted too, so nothing is lost.
+func (r *chatResult) setUpstreamError(data string) {
+	var flat struct {
+		Code    int    `json:"code"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal([]byte(data), &flat) == nil {
+		if flat.Code != 0 {
+			r.errCode = flat.Code
+		}
+		if flat.Message != "" {
+			r.errMsg = flat.Message
+		} else if flat.Error != "" {
+			r.errMsg = flat.Error
+		}
+	}
+	if r.errMsg == "" {
+		var nested struct {
+			Error struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(data), &nested) == nil && nested.Error.Message != "" {
+			if nested.Error.Code != 0 {
+				r.errCode = nested.Error.Code
+			}
+			r.errMsg = nested.Error.Message
+		}
+	}
+	if r.errMsg == "" {
+		r.errMsg = truncate(data, 300) // keep the raw payload as a last resort
+	}
+	log.Printf("[sse] upstream error code=%d msg=%s", r.errCode, truncate(r.errMsg, 300))
 }
 
 // debugSSE logs every upstream SSE event and payload; enable with
@@ -894,13 +1043,19 @@ func handleEvents(ctx context.Context, body io.Reader, onOutput func(outputEvent
 			if json.Unmarshal([]byte(ev.data), &d) == nil && d.FinishReason != "" {
 				res.finish = d.FinishReason
 			}
+		case "error", "exception":
+			// The upstream refused the request (stale client version, revoked
+			// token, quota...). Keep the payload: it is the only description of
+			// the failure, which the client would otherwise never see.
+			res.setUpstreamError(ev.data)
 		default:
-			// Trae can push "error"/"exception" side events mid-stream. Never
-			// swallow them silently: they are exactly the difference between
-			// "model returned empty content" and "upstream failed".
+			// Trae can push error side events under other names; never swallow
+			// them silently, they are exactly the difference between "model
+			// returned empty content" and "upstream failed".
 			if strings.Contains(ev.name, "error") || strings.Contains(ev.name, "exception") ||
 				strings.Contains(ev.data, `"error"`) {
 				log.Printf("[sse] upstream error event %q: %s", ev.name, truncate(ev.data, 400))
+				res.setUpstreamError(ev.data)
 			} else if debugSSE {
 				log.Printf("[sse] unhandled event %q", ev.name)
 			}
@@ -919,11 +1074,52 @@ func openAIUsage(u *usageEvent) map[string]any {
 	}
 }
 
+// consumeUpstream reads one upstream SSE stream into res. When the backend
+// refuses our client version before producing any output, it retries once with
+// clientVersionFallback. The retry is safe because neither serve path has
+// written anything to the client at that point.
+func (s *Server) consumeUpstream(ctx context.Context, resp *http.Response, open func(string) (*http.Response, error),
+	versionCode string, onOutput func(outputEvent), res *chatResult) error {
+
+	err := handleEvents(ctx, resp.Body, onOutput, res)
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	if res.errCode != errCodeVersionRejected || !res.empty() || versionCode == clientVersionFallback {
+		return nil
+	}
+
+	log.Printf("[chat] backend rejected client version_code=%s; retrying with %s",
+		versionCode, clientVersionFallback)
+	*res = chatResult{}
+	retry, err := open(clientVersionFallback)
+	if err != nil {
+		return err
+	}
+	err = handleEvents(ctx, retry.Body, onOutput, res)
+	retry.Body.Close()
+	if res.errCode != errCodeVersionRejected {
+		s.noteWorkingVersion(clientVersionFallback)
+	}
+	return err
+}
+
 // collectSSE: non-stream mode — aggregate all events, return one completion.
-func (s *Server) collectSSE(w http.ResponseWriter, body io.Reader, id string, created int64, oai OAIRequest, model ModelInfo) {
+func (s *Server) collectSSE(w http.ResponseWriter, resp *http.Response, open func(string) (*http.Response, error),
+	versionCode, id string, created int64, oai OAIRequest, model ModelInfo) {
+
 	var res chatResult
-	if err := handleEvents(context.Background(), body, nil, &res); err != nil {
+	if err := s.consumeUpstream(context.Background(), resp, open, versionCode, nil, &res); err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "stream read error: "+err.Error(), "server_error")
+		return
+	}
+	if res.empty() && res.errMsg != "" {
+		// Nothing usable came back, but the upstream said why: surface the real
+		// reason instead of an empty completion the client renders as a
+		// contentless truncation.
+		log.Printf("[chat] ERROR: %s (model=%s)", res.upstreamErr(), model.ConfigName)
+		writeOpenAIError(w, http.StatusBadGateway, res.upstreamErr(), "upstream_error")
 		return
 	}
 	if !res.sawDone {
@@ -937,7 +1133,7 @@ func (s *Server) collectSSE(w http.ResponseWriter, body io.Reader, id string, cr
 			res.finish = "length" // stream terminated upstream without a stop
 		}
 	}
-	if res.content.Len() == 0 && res.reasoning.Len() == 0 && len(res.toolCalls) == 0 {
+	if res.empty() {
 		log.Printf("[chat] WARN: upstream returned empty completion (finish=%q, model=%s)",
 			res.finish, model.ConfigName)
 	}
@@ -949,7 +1145,7 @@ func (s *Server) collectSSE(w http.ResponseWriter, body io.Reader, id string, cr
 		msg["tool_calls"] = normalizeToolCalls(res.toolCalls)
 		msg["content"] = nil
 	}
-	resp := map[string]any{
+	out := map[string]any{
 		"id": id, "object": "chat.completion", "created": created,
 		"model": model.ConfigName,
 		"choices": []map[string]any{
@@ -957,41 +1153,54 @@ func (s *Server) collectSSE(w http.ResponseWriter, body io.Reader, id string, cr
 		},
 	}
 	if u := openAIUsage(res.usage); u != nil {
-		resp["usage"] = u
+		out["usage"] = u
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(out)
 }
 
 // streamSSE: stream mode — emit chat.completion.chunk per output event.
-func (s *Server) streamSSE(w http.ResponseWriter, body io.Reader, id string, created int64, oai OAIRequest, model ModelInfo) {
+func (s *Server) streamSSE(w http.ResponseWriter, resp *http.Response, open func(string) (*http.Response, error),
+	versionCode, id string, created int64, oai OAIRequest, model ModelInfo) {
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeOpenAIError(w, http.StatusInternalServerError, "streaming unsupported", "server_error")
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 
+	// Headers go out lazily, on the first real delta. As long as nothing has been
+	// written an upstream refusal can still be reported as a proper HTTP error
+	// instead of an empty 200 stream that clients render as a contentless
+	// truncation.
+	started := false
 	send := func(chunk map[string]any) {
+		if !started {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(http.StatusOK)
+			started = true
+		}
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	}
-
-	// initial role chunk
-	send(map[string]any{
-		"id": id, "object": "chat.completion.chunk", "created": created, "model": model.ConfigName,
-		"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
-	})
+	roleChunk := func() {
+		send(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model.ConfigName,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
+		})
+	}
 
 	var res chatResult
 	ctx := context.Background()
-	err := handleEvents(ctx, body, func(o outputEvent) {
+	err := s.consumeUpstream(ctx, resp, open, versionCode, func(o outputEvent) {
 		if o.Response == "" && o.ReasoningContent == nil && (len(o.ToolCalls) == 0 || string(o.ToolCalls) == "null") {
 			return
+		}
+		if !started {
+			roleChunk() // open on the first output, never on a doomed stream
 		}
 		delta := map[string]any{}
 		if o.Response != "" {
@@ -1009,6 +1218,20 @@ func (s *Server) streamSSE(w http.ResponseWriter, body io.Reader, id string, cre
 		})
 	}, &res)
 
+	if !started {
+		switch {
+		case err != nil:
+			writeOpenAIError(w, http.StatusBadGateway, "stream read error: "+err.Error(), "server_error")
+			return
+		case res.empty() && res.errMsg != "":
+			log.Printf("[chat] ERROR: %s (model=%s)", res.upstreamErr(), model.ConfigName)
+			writeOpenAIError(w, http.StatusBadGateway, res.upstreamErr(), "upstream_error")
+			return
+		default:
+			roleChunk() // legitimate empty completion: upstream sent done, no output
+		}
+	}
+
 	finish := res.finish
 	if finish == "" {
 		if err != nil {
@@ -1023,7 +1246,14 @@ func (s *Server) streamSSE(w http.ResponseWriter, body io.Reader, id string, cre
 		log.Printf("[chat] WARN: upstream stream ended without done event (content=%d bytes)",
 			res.content.Len())
 	}
-	if res.content.Len() == 0 && res.reasoning.Len() == 0 && len(res.toolCalls) == 0 {
+	if res.errMsg != "" && !res.empty() {
+		// A partial answer was already streamed: keep it and end honestly with
+		// "length". (No error object is emitted mid-stream on purpose - clients
+		// disagree on it and some abort the whole turn.)
+		log.Printf("[chat] WARN: %s after partial output (finish=%q, model=%s)",
+			res.upstreamErr(), finish, model.ConfigName)
+	}
+	if res.empty() {
 		log.Printf("[chat] WARN: upstream returned empty completion (finish=%q, model=%s)",
 			finish, model.ConfigName)
 	}
@@ -1053,7 +1283,7 @@ func main() {
 	cfg.APIKey = loadOrCreateAPIKey(cfg)
 	log.Printf("[auth] client API key: %s", cfg.APIKey)
 	if cfg.Host == "" || cfg.PAT == "" {
-		log.Printf("[cfg] TRAE_HOST=%s state=%s", cfg.Host, cfg.StateFile)
+		log.Printf("[cfg] TRAE_HOST=%s state=%s version_code=%s", cfg.Host, cfg.StateFile, cfg.VersionCode)
 	}
 
 	tm := NewTokenManager(cfg)
@@ -1062,7 +1292,7 @@ func main() {
 	}
 	tm.StartRefreshLoop()
 
-	registry := NewModelRegistry(cfg.Host, tm)
+	registry := NewModelRegistry(cfg.Host, tm, cfg.VersionCode)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	if err := registry.Fetch(ctx); err != nil {
 		log.Printf("[models] initial fetch failed: %v (will serve empty list)", err)

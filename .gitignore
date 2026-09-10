@@ -27,6 +27,14 @@ go.work.sum
 # env file
 .env
 
+# Built binary
+/traeopenai
+/traeopenai.new
+
+# Editor / local tool artifacts
+.idea/
+.zvec-grep/
+
 # Editor/IDE
 # .idea/
 # .vscode/

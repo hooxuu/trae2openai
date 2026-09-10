@@ -57,8 +57,20 @@ docker run --rm -p 8686:8686 \
 | `TRAE_LISTEN` | 服务监听地址 | `127.0.0.1:8686` |
 | `TRAE_HOST` | Trae 后端地址 | `https://api.enterprise.trae.cn` |
 | `TRAE_STATE_FILE` | Token 状态文件路径 | `~/.trae-openai-state.json` |
+| `TRAE_IDE_VERSION_CODE` | 提供给 Trae 后端的客户端版本号（后端会拒绝过旧版本） | 当天日期，如 `20260910` |
+| `TRAE_DEBUG_SSE` | 设为 `1` 时打印上游 SSE 事件与外发请求，便于排障 | 关闭 |
 
 请妥善保管 PAT、API Key 和状态文件，不要提交到 Git 仓库。使用本项目时请遵守 Trae 的服务条款。
+
+## 排障
+
+上游拒绝请求（客户端版本过旧、凭据失效、配额不足）时会以 HTTP 502 返回真实原因：
+
+```json
+{"error": {"message": "upstream error (code 1001): We're sorry, but we are not able to authenticate you.", "type": "upstream_error"}}
+```
+
+若已在流式输出中途失败，则保留已输出的部分并将 `finish_reason` 置为 `length`。需要更细的链路日志时用 `TRAE_DEBUG_SSE=1` 启动，会打印每条上游 SSE 事件和外发 payload。
 
 ## License
 
