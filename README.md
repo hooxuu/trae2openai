@@ -26,37 +26,100 @@ TRAE_LISTEN=127.0.0.1:8686 \
 go run .
 ```
 
-调用示例：
+调用示例（模型名用 `GET /v1/models` 查当前可用列表）：
 
 ```bash
 curl http://127.0.0.1:8686/v1/chat/completions \
   -H 'Authorization: Bearer sk-your-key' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"kimi-k2.6","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"kimi-k3","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-可先通过 `/v1/models` 查询当前账号可用的模型。
+## Docker 部署
 
-## Docker
+镜像基于 `scratch`（无 shell、无包管理器，只有二进制和 CA 证书），默认监听 `0.0.0.0:8686`，状态文件固定在 `/data`。
+因此：
+
+- **必须挂载 `/data`**，否则重建容器就要重新登录（`state.json` 和 `.trae-openai-apikey` 都在里面）；
+- **不能**用容器内命令做健康检查，要从外部探测 `/healthz`（k8s 用 `httpGet`，宿主机用 `curl`）。
+
+### 构建
+
+目标机是远端 linux/amd64 而本机是 Apple Silicon 时，用 buildx 交叉构建：
 
 ```bash
-docker build -t traeopenai .
-docker run --rm -p 8686:8686 \
-  -e TRAE_PAT=trae-lt-... \
+# 本机构建并加载（部署机与构建机同一台时）
+docker buildx build --platform linux/amd64 -t traeopenai:latest --load .
+
+# 构建并推送，供远端服务器拉取
+docker buildx build --platform linux/amd64 -t <registry>/traeopenai:latest --push .
+```
+
+### 运行
+
+```bash
+docker run -d --name traeopenai --restart unless-stopped \
+  -p 127.0.0.1:8686:8686 \
+  -e TRAECLI_PERSONAL_ACCESS_TOKEN=trae-lt-... \
   -e TRAE_PROXY_API_KEY=sk-your-key \
   -v traeopenai-data:/data \
-  traeopenai
+  traeopenai:latest
 ```
+
+- `TRAECLI_PERSONAL_ACCESS_TOKEN`：官方 CLI 登录令牌（专为 Docker/CI 场景，见下文「凭据失效」）；等价别名是 `TRAE_PAT`。
+- `TRAE_PROXY_API_KEY`：客户端调用本服务用的 `sk-` key；不填则自动生成并写入 `/data/.trae-openai-apikey`（启动日志会打印）。
+- `-p 127.0.0.1:8686:8686` 表示只绑定回环、由反向代理对外暴露；需要局域网直连时改成 `-p 8686:8686`。
+
+### docker compose
+
+```yaml
+services:
+  traeopenai:
+    image: traeopenai:latest
+    container_name: traeopenai
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8686:8686"
+    environment:
+      TRAECLI_PERSONAL_ACCESS_TOKEN: "trae-lt-..."
+      TRAE_PROXY_API_KEY: "sk-your-key"
+      # 版本门槛变化时才需要显式指定（见「版本门槛」）
+      # TRAE_IDE_VERSION_CODE: "20260206"
+      # 排查上游问题时打开，会把每条上游 SSE 事件和外发 payload 写进日志
+      # TRAE_DEBUG_SSE: "1"
+    volumes:
+      - traeopenai-data:/data
+
+volumes:
+  traeopenai-data:
+```
+
+### 升级
+
+```bash
+docker buildx build --platform linux/amd64 -t traeopenai:latest --load .
+docker compose up -d --force-recreate   # 或 docker rm -f traeopenai && docker run ...
+```
+
+`/data` 里的登录态与客户端 key 会保留，升级不需要重新登录；除非令牌本身失效（见下文）。
+
+### 对外暴露
+
+本服务用 `Authorization: Bearer sk-...` 鉴权，但**明文 HTTP 不提供传输加密**。若像远端服务器那样直接暴露在公网（客户端 `baseUrl` 写 `http://<ip>:8686`），建议：
+
+- 前面加一层 TLS 反向代理（nginx / Caddy），只对外开 80/443，8686 只绑回环；
+- 或用安全组 / 防火墙把 8686 限制到可信 IP；
+- 客户端 `baseUrl` 相应改成 `https://...`。
 
 ## 配置
 
 | 环境变量 | 说明 | 默认值 |
 | --- | --- | --- |
-| `TRAE_PAT` | Trae 个人访问令牌 | 无 |
+| `TRAE_PAT` | Trae 个人访问令牌（官方名 `TRAECLI_PERSONAL_ACCESS_TOKEN` 也接受，`TRAE_PAT` 优先） | 无 |
 | `TRAE_PROXY_API_KEY` | 客户端调用代理时使用的 API Key | 自动生成 |
-| `TRAE_LISTEN` | 服务监听地址 | `127.0.0.1:8686` |
+| `TRAE_LISTEN` | 服务监听地址 | `127.0.0.1:8686`（Docker 镜像内为 `0.0.0.0:8686`） |
 | `TRAE_HOST` | Trae 后端地址 | `https://api.enterprise.trae.cn` |
-| `TRAE_STATE_FILE` | Token 状态文件路径 | `~/.trae-openai-state.json` |
+| `TRAE_STATE_FILE` | Token 状态文件路径 | `~/.trae-openai-state.json`（Docker 镜像内为 `/data/state.json`） |
 | `TRAE_IDE_VERSION_CODE` | 提供给 Trae 后端的客户端版本号（后端会拒绝过旧版本，见 DESIGN.md 坑 6） | 内置已验证值 `20260206`（官方客户端当前发送的值） |
 | `TRAE_ALLOW_VERSION_FALLBACK` | 设为 `1` 时允许版本被拒后用合成版本号重试一次（应急，见 DESIGN.md 坑 6） | 关闭 |
 | `TRAE_DEBUG_SSE` | 设为 `1` 时打印上游 SSE 事件与外发请求，便于排障 | 关闭 |
