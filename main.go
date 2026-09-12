@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -841,6 +842,43 @@ func convertTools(raw json.RawMessage) (json.RawMessage, error) {
 	return json.Marshal(out)
 }
 
+// sanitizeCallID rewrites a Responses tool-call id into a form the Trae
+// upstream can reliably pair between the assistant tool_call and the matching
+// tool message. Codex CLI and similar clients emit ids like "exec_command:0"
+// (tool-name:index) rather than OpenAI's "call_..."; the colon (and any other
+// non-token byte) makes the eino backend fail to match the follow-up tool
+// message, which it reports as code 4027 "an assistant message with
+// 'tool_calls' must be followed by tool messages ... <id>". Mapping both sides
+// through the same deterministic function keeps assistant and tool ids equal
+// while giving the upstream a clean, stable token. Already-safe ids pass
+// through unchanged so OpenAI-native clients are unaffected.
+func sanitizeCallID(id string) string {
+	if id == "" {
+		return id
+	}
+	safe := true
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			safe = false
+			break
+		}
+	}
+	if safe && (strings.HasPrefix(id, "call_") || strings.HasPrefix(id, "fc_")) {
+		return id
+	}
+	if safe {
+		// Alphanumeric but not in a recognized namespace: keep it readable but
+		// anchor it under call_ so the upstream sees a consistent shape.
+		return "call_" + id
+	}
+	// Contains characters the upstream mishandles (':', '/', '.', ...). Replace
+	// with a deterministic digest so the same external id always maps to the
+	// same internal id within and across requests of a stateless turn.
+	sum := sha1.Sum([]byte(id))
+	return "call_" + hex.EncodeToString(sum[:8])
+}
+
 // denormalizeToolCalls is the request-direction inverse of normalizeToolCalls:
 // OpenAI clients send assistant tool_calls as {id, type, function:{name,
 // arguments}}, but Trae's eino backend emits/expects function_call (not
@@ -1094,9 +1132,10 @@ func convertResponsesToMessages(req *ResponsesRequest) ([]OAIMessage, error) {
 		case "function_call":
 			// An assistant turn that called a tool. Rebuild the OpenAI assistant
 			// message carrying tool_calls; denormalizeToolCalls (in convertMessages)
-			// turns it into the function_call shape the upstream expects.
+			// turns it into the function_call shape the upstream expects. The id is
+			// normalized so the upstream can pair it with the tool message below.
 			call := map[string]any{
-				"id":   it.CallID,
+				"id":   sanitizeCallID(it.CallID),
 				"type": "function",
 				"function": map[string]string{
 					"name":      it.Name,
@@ -1132,7 +1171,7 @@ func convertResponsesToMessages(req *ResponsesRequest) ([]OAIMessage, error) {
 			msgs = append(msgs, OAIMessage{
 				Role:       "tool",
 				Content:    json.RawMessage(strconv.Quote(outStr)),
-				ToolCallID: it.CallID,
+				ToolCallID: sanitizeCallID(it.CallID),
 			})
 
 		case "reasoning":
