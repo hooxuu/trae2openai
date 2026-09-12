@@ -6,6 +6,7 @@
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`（OpenAI 新版 Responses API，Codex CLI / openai SDK 等客户端使用）
 - 流式响应、工具调用与 Token 自动续期
 - API Key 鉴权
 
@@ -34,6 +35,29 @@ curl http://127.0.0.1:8686/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"kimi-k3","messages":[{"role":"user","content":"你好"}]}'
 ```
+
+### Responses API（`/v1/responses`）
+
+新版 OpenAI Responses 端点同样支持，非流式与流式皆可。适配层把 `instructions` 与
+`input[]`（message / function_call / function_call_output）折叠成内部 chat 消息发给
+Trae 后端，再把 chat 输出重新包装成 `response.*` 事件序列（流式）或单个 `response`
+对象（非流式）。reasoning 内容映射为 message 项里的 `summary_text` 部分。
+
+```bash
+curl http://127.0.0.1:8686/v1/responses \
+  -H 'Authorization: Bearer sk-your-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"kimi-k3","instructions":"You are terse.","input":"你好"}'
+```
+
+说明（有意为之的取舍）：
+
+- **无状态**：`store`、`previous_response_id` 被接受但忽略——客户端需每次重发完整历史
+  （Codex CLI / openai SDK 默认正是这么工作的）。
+- **工具**：仅支持 `function` 类型；`web_search_preview` / `file_search` / `code_interpreter`
+  等后端不支持的类型会被静默跳过，不会让请求报错。
+- 不支持的字段（`background` / `include` / `metadata` / `truncation` 等）被解析后丢弃，
+  不会到达上游。
 
 ## Docker 部署
 
