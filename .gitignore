@@ -36,6 +36,7 @@ go.work.sum
 .zvec-grep/
 .mcp.json
 .pi/
+DESIGN.md
 
 # Editor/IDE
 # .idea/
