@@ -34,6 +34,8 @@ go.work.sum
 # Editor / local tool artifacts
 .idea/
 .zvec-grep/
+.mcp.json
+.pi/
 
 # Editor/IDE
 # .idea/
