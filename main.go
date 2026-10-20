@@ -415,7 +415,7 @@ func (mr *ModelRegistry) fetchWith(ctx context.Context, versionCode string) erro
 	}
 	req, _ := http.NewRequestWithContext(ctx, "POST",
 		mr.host+"/api/ide/v1/cli/get_config_list",
-		strings.NewReader(`{"function":"chat","version_code":`+versionCode+`}`))
+		strings.NewReader(`{"function":"chat"}`))
 	setIDEHeaders(req, token, versionCode)
 
 	resp, err := http.DefaultClient.Do(req)
@@ -451,17 +451,22 @@ func (mr *ModelRegistry) fetchWith(ctx context.Context, versionCode string) erro
 		if !c.ConfigSwitch || c.ConfigName == "custom_model_placeholder" || c.ConfigName == "summary" {
 			continue
 		}
-		info := ModelInfo{
+		// A catalog entry with no model_detail_list has no wire model_name, and
+		// the backend answers code 4023 "the model is unknown" for whatever we
+		// would send instead. These entries carry display_config.is_invisible_to_user
+		// and the official CLI does not surface them either, so never advertise a
+		// model we cannot actually call.
+		if len(c.ModelDetailList) == 0 || c.ModelDetailList[0].ModelName == "" {
+			log.Printf("[models] skip %q: no wire model_name (model_detail_list empty)", c.ConfigName)
+			continue
+		}
+		models[c.ConfigName] = ModelInfo{
 			ConfigName:  c.ConfigName,
-			ModelName:   c.ConfigName,
+			ModelName:   c.ModelDetailList[0].ModelName,
 			DisplayName: c.DisplayConfig.DisplayName,
+			MaxTokens:   c.ModelDetailList[0].MaxTokens,
 			Multimodal:  c.DisplayConfig.Multimodal,
 		}
-		if len(c.ModelDetailList) > 0 && c.ModelDetailList[0].ModelName != "" {
-			info.ModelName = c.ModelDetailList[0].ModelName
-			info.MaxTokens = c.ModelDetailList[0].MaxTokens
-		}
-		models[c.ConfigName] = info
 	}
 	if len(models) == 0 {
 		return fmt.Errorf("config list empty (body: %s)", truncate(string(raw), 200))
@@ -679,8 +684,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if convID == "" {
 		convID = newUUID()
 	}
-	userInput := extractLastUserText(oai.Messages)
-
 	traeMsgs, err := convertMessages(oai.Messages)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
@@ -698,7 +701,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ModelName:      model.ModelName,
 		SessionID:      sessionID,
 		Tools:          tools,
-		UserInput:      userInput,
 	}
 	payload, _ := json.Marshal(traeReq)
 
@@ -893,30 +895,6 @@ func normalizeToolCalls(raw json.RawMessage) json.RawMessage {
 	return out
 }
 
-func extractLastUserText(msgs []OAIMessage) string {
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role != "user" {
-			continue
-		}
-		var s string
-		if json.Unmarshal(msgs[i].Content, &s) == nil {
-			return s
-		}
-		var parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if json.Unmarshal(msgs[i].Content, &parts) == nil {
-			for _, p := range parts {
-				if p.Type == "text" && p.Text != "" {
-					return p.Text
-				}
-			}
-		}
-	}
-	return ""
-}
-
 // --- SSE parsing ---
 
 type sseEvent struct {
@@ -965,9 +943,11 @@ type outputEvent struct {
 }
 
 type usageEvent struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens         int `json:"prompt_tokens"`
+	CompletionTokens     int `json:"completion_tokens"`
+	TotalTokens          int `json:"total_tokens"`
+	CacheReadInputTokens int `json:"cache_read_input_tokens"`
+	ReasoningTokens      int `json:"reasoning_tokens"`
 }
 
 type chatResult struct {
@@ -1104,11 +1084,22 @@ func openAIUsage(u *usageEvent) map[string]any {
 	if u == nil {
 		return nil
 	}
-	return map[string]any{
+	out := map[string]any{
 		"prompt_tokens":     u.PromptTokens,
 		"completion_tokens": u.CompletionTokens,
 		"total_tokens":      u.TotalTokens,
 	}
+	// Trae reports cache-read and reasoning token counts separately; surface
+	// them in the OpenAI nested detail objects so clients can account for them.
+	// Each detail object is omitted when the upstream reported zero, so clients
+	// that dislike empty details keep seeing the previous shape.
+	if u.CacheReadInputTokens > 0 {
+		out["prompt_tokens_details"] = map[string]any{"cached_tokens": u.CacheReadInputTokens}
+	}
+	if u.ReasoningTokens > 0 {
+		out["completion_tokens_details"] = map[string]any{"reasoning_tokens": u.ReasoningTokens}
+	}
+	return out
 }
 
 // consumeUpstream reads one upstream SSE stream into res. When the backend
